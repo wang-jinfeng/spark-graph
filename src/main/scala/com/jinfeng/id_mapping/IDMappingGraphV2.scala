@@ -5,7 +5,6 @@ import org.apache.commons.lang3.StringUtils
 import org.apache.spark.graphx.{Edge, Graph, VertexId, VertexRDD}
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.storage.StorageLevel
 
 import java.io.UnsupportedEncodingException
 import java.security.{MessageDigest, NoSuchAlgorithmException}
@@ -78,8 +77,6 @@ object IDMappingGraphV2 {
     val spark: SparkSession = SparkSession.builder()
       .master("local[8]")
       .appName("IDMapping")
-      .config("spark.rdd.compress", "true")
-      .config("spark.sql.orc.filterPushdown", "true")
       .getOrCreate()
     oldAndTodayIdMapping("CN", "ios", "20220706", spark, "output", "result_output", 10)
   }
@@ -128,27 +125,43 @@ object IDMappingGraphV2 {
     }
 
     //  val df = spark.sql(dailySQL)
-    val df = spark.read.orc("/Users/wangjf/Downloads/part-00000-8d2800cd-b011-4a27-bcf7-85a08d4afcf3-c000.zlib.orc")
+    val df = spark.read.orc("/Users/mbj0538/Downloads/data/part-00000-8d2800cd-b011-4a27-bcf7-85a08d4afcf3-c000.zlib.orc")
 
     val todayDF = spark.createDataFrame(df.rdd.map(row => {
       processData(row, platform)
     }), schema = schema)
+
+    println("--- todayDF start ---")
+    todayDF.rdd.foreach(println)
+    println("--- todayDF end ---")
 
     val schedule_date = sdf1.format(sdf2.parse(date))
     val vertex = todayDF.rdd.map(row => {
       processVertex(schedule_date, row, idSet, idMainSet)
     }).flatMap(l => l)
 
+    println("--- vertex start ---")
+    vertex.foreach(println)
+    println("--- vertex end ---")
+
     val edge = todayDF.rdd.map(row => {
       processEdge(schedule_date, row, idSet, idMainSet)
     }).flatMap(l => l)
 
+    println("--- edge start ---")
+    edge.foreach(println)
+    println("--- edge end ---")
+
     //  vertex.persist(StorageLevel.MEMORY_AND_DISK_SER)
     val graph = Graph(vertex, edge)
 
-    val maxGraph = graph.connectedComponents()
+    val maxGraph = graph.connectedComponents(10)
 
     val result: VertexRDD[VertexId] = maxGraph.vertices
+
+    println("--- result start ---")
+    result.foreach(println)
+    println("--- result end ---")
 
     val resultVertex = result.map(rs => (rs._2, rs._1)).groupByKey()
       .map(rs => {
@@ -166,17 +179,17 @@ object IDMappingGraphV2 {
       })
     }).groupByKey().mapPartitions(rs => {
       val array = new ArrayBuffer[Result]()
-      val json = new JSONObject()
       rs.foreach(r => {
-        r._2.toList.sortBy(t => (idSet.indexOf(t._2), t._1))(Ordering.Tuple2(Ordering.Int, Ordering.String))
-          .foreach(one => {
-            if (json.isEmpty) {
-              json.put("one_id", one._1)
-              json.put("type", one._2)
-              json.put("version", "")
-            }
-            array += Result(one._1, one._2, json.toJSONString, "")
-          })
+        val json = new JSONObject()
+        val sortedList = r._2.toList.sortBy(t => (idSet.indexOf(t._2), t._3))(Ordering.Tuple2(Ordering.Int, Ordering.Long))
+        sortedList.foreach(one => {
+          if (json.isEmpty) {
+            json.put("one_id", one._1)
+            json.put("type", one._2)
+            json.put("version", "")
+          }
+          array += Result(one._1, one._2, json.toJSONString, "")
+        })
       })
       array.iterator
     })
@@ -370,7 +383,7 @@ object IDMappingGraphV2 {
     for (i <- ids.indices) {
       var keyType = ids(i)
       if (StringUtils.isNotBlank(row.getAs[String](keyType)) && flag) {
-        var mainVertexID = if (row.getAs[String](keyType).matches(md5Ptn)) {
+        val mainVertexID = if (row.getAs[String](keyType).matches(md5Ptn)) {
           getMD5Long(row.getAs[String](String.valueOf(keyType)))
         } else {
           getMD5Long(hashMD5(row.getAs[String](keyType)))
@@ -381,8 +394,10 @@ object IDMappingGraphV2 {
          * 否 —> 辅节点 VertexID +  主节点 VertexID，避免IPUa等碰撞率高的节点互串，造成数据异常
          * 是 —> 主节点 VertexID
          */
-        if (!mainIDSet.contains(keyType)) {
-          mainVertexID = mainVertexID + mainVertexID
+        val mainKeyVertexID = if (!mainIDSet.contains(keyType)) {
+          mainVertexID + mainVertexID
+        } else {
+          mainVertexID
         }
         for (j <- i + 1 until ids.length) {
           keyType = ids(j)
@@ -393,55 +408,14 @@ object IDMappingGraphV2 {
               getMD5Long(hashMD5(row.getAs[String](keyType)))
             }
             if (!mainIDSet.contains(keyType)) {
-              array += Edge(mainVertexID, keyVertexID + mainVertexID, "")
+              array += Edge(mainKeyVertexID, keyVertexID + mainVertexID, "")
             } else {
-              array += Edge(mainVertexID, keyVertexID, "")
+              array += Edge(mainKeyVertexID, keyVertexID, "")
             }
           }
         }
         flag = false
       }
-    }
-    array
-  }
-
-  /**
-   *
-   * @param kv
-   * @param mainIDSet
-   * @return
-   * ((srcID,srcType),oneID)
-   */
-  def updateOneID(active_date: String, kv: ((String, String), Set[(String, String, Long)]), idArray: Array[String], mainIDSet: Set[String]): ArrayBuffer[((String, String), String)] = {
-    val array = new ArrayBuffer[((String, String), String)]()
-    val tmpOneId = kv._1._1
-    val tmpOneIdType = kv._1._2
-    val iters = kv._2
-    val oneID = new JSONObject()
-    var minTypeIndex = idArray.indexOf(tmpOneIdType)
-    iters.foreach(t => {
-      if (idArray.indexOf(t._2) < minTypeIndex) {
-        minTypeIndex = idArray.indexOf(t._2)
-      }
-      if (tmpOneId.equals(t._1) || mainIDSet.contains(t._2)) {
-        val json = new JSONObject()
-        json.put("one_type", t._2)
-        json.put("one_date", active_date)
-        json.put("one_cnt", t._3)
-        oneID.put(t._1, json)
-      }
-    })
-    array += (((tmpOneId, tmpOneIdType), oneID.toJSONString))
-    if (idArray.indexOf(tmpOneIdType) > minTypeIndex) {
-      iters.map(itr => {
-        var oneJSON = new JSONObject()
-        if (oneID.containsKey(itr._1)) {
-          oneJSON.put(itr._1, oneID.getJSONObject(itr._1))
-        } else {
-          oneJSON = oneID
-        }
-        array += (((itr._1, itr._2), oneJSON.toJSONString))
-      })
     }
     array
   }

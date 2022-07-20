@@ -2,7 +2,6 @@ package com.jinfeng.id_mapping
 
 import com.alibaba.fastjson.{JSON, JSONObject}
 import org.apache.commons.lang3.StringUtils
-import org.apache.spark.graphx.lib.StronglyConnectedComponents
 import org.apache.spark.graphx.{Edge, Graph, VertexId, VertexRDD}
 import org.apache.spark.sql.SparkSession
 import org.json4s.jackson.Serialization
@@ -11,9 +10,10 @@ import java.io.UnsupportedEncodingException
 import java.math.BigInteger
 import java.security.{MessageDigest, NoSuchAlgorithmException}
 import java.util.UUID
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-case class Ios(idfa: String, idfv: String, ipua: String) extends Serializable
+case class Ios(idfa: String, idfv: String, bkupid: String, region: String) extends Serializable
 
 object SparkGraph {
 
@@ -30,15 +30,16 @@ object SparkGraph {
     val sc = spark.sparkContext
 
     val mainSet = Set("idfa", "idfv")
-    val arr = Array("idfa", "idfv", "ipua")
+    val arr = Array("idfa", "idfv", "bkupid")
     try {
-      val rdd = sc.parallelize(Seq(Ios("A", "a", "1.1.1.1mob"), Ios("B", "a", "1.1.1.1emr"),
-        Ios("C", "c", "1.1.1.1emr"), Ios("A", "d", "1.1.1.1uc"), Ios("A", "a", "1.1.1.1mob")))
+      val rdd = sc.parallelize(Seq(Ios("A", "a", "1.1.1.1mob", "cn"), Ios("B", "a", "1.1.1.1emr", "se"),
+        Ios("C", "c", "1.1.1.1emr", "vg"), Ios("A", "d", "1.1.1.1uc", "hk"), Ios("A", "a", "1.1.1.1mob", "cn")))
       val vert = rdd.map(r => {
+        val region = r.region
         implicit val formats = org.json4s.DefaultFormats
         val json = JSON.parseObject(Serialization.write(r))
         var mainID = 0L
-        val array = new ArrayBuffer[(Long, (String, String))]()
+        val array = new ArrayBuffer[(Long, (String, String, String))]()
         for (key <- arr if StringUtils.isNotBlank(json.getString(key))) {
           if (mainID == 0) {
             mainID = getMD5Long(json.getString(key))
@@ -47,10 +48,25 @@ object SparkGraph {
           if (!mainSet.contains(key)) {
             keyID = keyID + mainID
           }
-          array += ((keyID, (json.getString(key), key)))
+          array += ((keyID, (json.getString(key), key, region)))
         }
         array
-      }).flatMap(l => l).distinct(100)
+      }).flatMap(l => l)
+        .groupByKey()
+        .map(rs => {
+          val vertexId = rs._1
+          var deviceId = ""
+          var deviceType = ""
+          val regionSet = new mutable.HashSet[String]()
+          rs._2.foreach(r => {
+            if (StringUtils.isBlank(deviceId)) {
+              deviceId = r._1
+              deviceType = r._2
+            }
+            regionSet.add(r._3)
+          })
+          (vertexId, (deviceId, deviceType, regionSet.mkString(";")))
+        })
 
       println("--- Vert.start ---")
       vert.foreach(println)
@@ -111,20 +127,21 @@ object SparkGraph {
 
       val uidRDD = resultVert.join(vert).map(r => {
         (r._2._1, r._2._2)
-      }).groupByKey().map(r => {
-        val array = new ArrayBuffer[Result]()
-        val json = new JSONObject()
-        r._2.toList.sortBy(t => (arr.indexOf(t._2), t._1))(Ordering.Tuple2(Ordering.Int, Ordering.String))
-          .foreach(one => {
-            if (json.isEmpty) {
-              json.put("one_id", one._1)
-              json.put("type", one._2)
-              json.put("version", "")
-            }
-            array += Result(one._1, one._2, json.toJSONString, "")
-          })
-        array
-      })
+      }).groupByKey()
+        .map(r => {
+          val array = new ArrayBuffer[Result]()
+          val json = new JSONObject()
+          r._2.toList.sortBy(t => (arr.indexOf(t._2), t._1))(Ordering.Tuple2(Ordering.Int, Ordering.String))
+            .foreach(one => {
+              if (json.isEmpty) {
+                json.put("one_id", one._1)
+                json.put("type", one._2)
+                json.put("version", "")
+              }
+              array += Result(one._1, one._2, json.toJSONString, one._3)
+            })
+          array
+        })
 
       println("--- OneID.start ---")
       uidRDD.foreach(println)

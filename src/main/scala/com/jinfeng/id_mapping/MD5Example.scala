@@ -7,11 +7,16 @@ import java.security.{MessageDigest, NoSuchAlgorithmException}
 object MD5Example {
 
   def main(args: Array[String]): Unit = {
+    /*
     val md5 = hashMD5("")
     println(md5)
     val md5Lang = getMD5Long(md5)
     println(md5Lang)
     println(getMD5LongV2(""))
+    */
+
+    println(hashMD5("8711c3c7-87c1-496a-8a24-469d0cd71ecf")+" -- bkupid")
+    println(hashMD5("80A476C2-4136-406A-8F12-FB2F6E29F06B")+" -- idfa")
   }
 
   def hashMD5(content: String): String = {
