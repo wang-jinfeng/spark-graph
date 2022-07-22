@@ -253,7 +253,7 @@ object IDMappingGraph {
           update_date = ou._2
         }
       })
-      Result(srcId, srcType, oneIDJSON.toJSONString, update_date)
+      Result(srcId, srcType, oneIDJSON.toJSONString, "", update_date)
     })
 
     import spark.implicits._
@@ -299,7 +299,7 @@ object IDMappingGraph {
         json.put("type", oneIDScore.one_type)
         json.put("score", oneIDScore.one_score)
         json.put("version", oneIDScore.one_version)
-        Result(device_id, device_type, json.toJSONString, update_date)
+        Result(device_id, device_type, json.toJSONString, "", update_date)
       })
     })
   }

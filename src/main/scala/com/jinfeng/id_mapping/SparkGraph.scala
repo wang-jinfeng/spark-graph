@@ -138,7 +138,7 @@ object SparkGraph {
                 json.put("type", one._2)
                 json.put("version", "")
               }
-              array += Result(one._1, one._2, json.toJSONString, one._3)
+              array += Result(one._1, one._2, json.toJSONString, one._3, "")
             })
           array
         })

@@ -1,30 +1,33 @@
 package com.jinfeng.id_mapping
 
-import com.alibaba.fastjson.JSONObject
+import com.alibaba.fastjson.{JSON, JSONObject}
 import org.apache.commons.lang3.StringUtils
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.graphx.{Edge, Graph, VertexId, VertexRDD}
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.storage.StorageLevel
 
 import java.io.UnsupportedEncodingException
 import java.security.{MessageDigest, NoSuchAlgorithmException}
 import java.text.SimpleDateFormat
 import java.util.UUID
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-case class Result(device_id: String, device_type: String, one_id: String, update_date: String) extends Serializable
+case class Result(device_id: String, device_type: String, one_id: String, region: String, update_date: String) extends Serializable
 
 case class OneIDScore(one_id: String, one_type: String, one_score: Double, one_version: String) extends Serializable
 
 object IDMappingGraphV2 {
 
-  val iosIDSet = Array("idfa", "sysid", "bmosv_osv_upt", "bmosv_upt", "bmosv_ipua", "bkupid")
+  val iosIDSet = Array("idfa", "sysid", "idfv")
 
-  val iosMainIDSet = Set("idfa", "sysid")
+  val iosMainIDSet = Set("idfa", "sysid", "idfv")
 
-  val androidCNIDSet = Array("imei", "oaid", "gaid", "sysid", "android_id", "bmosv_upt", "bmosv_ipua", "bkupid")
+  val androidCNIDSet = Array("imei", "oaid", "gaid", "sysid", "android_id")
 
-  val androidIDSet = Array("gaid", "imei", "oaid", "sysid", "android_id", "bmosv_upt", "bmosv_ipua", "bkupid")
+  val androidIDSet = Array("gaid", "imei", "oaid", "sysid", "android_id")
 
   val androidCNMainIDSet = Set("gaid", "imei", "oaid", "sysid", "android_id")
 
@@ -127,41 +130,106 @@ object IDMappingGraphV2 {
     //  val df = spark.sql(dailySQL)
     val df = spark.read.orc("/Users/mbj0538/Downloads/data/part-00000-8d2800cd-b011-4a27-bcf7-85a08d4afcf3-c000.zlib.orc")
 
+    val sc = spark.sparkContext
+    val bTypeIDMap = sc.broadcast(typeIDMap)
+
     val todayDF = spark.createDataFrame(df.rdd.map(row => {
       processData(row, platform)
     }), schema = schema)
 
-    println("--- todayDF start ---")
-    todayDF.rdd.foreach(println)
-    println("--- todayDF end ---")
+    todayDF.persist(StorageLevel.MEMORY_AND_DISK_SER)
 
     val schedule_date = sdf1.format(sdf2.parse(date))
-    val vertex = todayDF.rdd.map(row => {
-      processVertex(schedule_date, row, idSet, idMainSet)
+
+    val oldVertex = spark.emptyDataFrame
+      .rdd.map(row => {
+      val vertexId = row.getAs[Long]("vertex_id")
+      val deviceId = row.getAs[String]("device_id")
+      val deviceType = row.getAs[String]("device_type")
+      val region = row.getAs[String]("region")
+      val cnt = row.getAs[Long]("cnt")
+      val update_date = row.getAs[String]("update_date")
+      val one_id = row.getAs[String]("one_id")
+      (vertexId, (deviceId, deviceType, region, cnt, update_date, one_id))
+    })
+    //  添加 region 信息
+    val todayVertex = todayDF.rdd.map(row => {
+      processTodayVertex(schedule_date, row, idSet, idMainSet, bTypeIDMap)
     }).flatMap(l => l)
+    //  新旧 vertex 合并
+    val vertex = oldVertex.union(todayVertex)
+      .groupByKey()
+      .map(rs => {
+        val vertexId = rs._1
+        var deviceId = ""
+        var deviceType = ""
+        var updateDate = ""
+        var oneID = ""
+        val regionSet = new mutable.HashSet[String]()
+        var cnt = 0L
+        rs._2.foreach(r => {
+          if (StringUtils.isBlank(deviceId)) {
+            deviceId = r._1
+            deviceType = r._2
+          }
+          if (StringUtils.isBlank(oneID)) {
+            oneID = r._6
+          }
+          r._3.split(";").foreach(re => {
+            regionSet.add(re)
+          })
+          cnt = cnt + r._4
+        })
+        (vertexId, (deviceId, deviceType, regionSet.mkString(";"), cnt, "", oneID))
+      }).distinct(coalesce * 4)
 
-    println("--- vertex start ---")
-    vertex.foreach(println)
-    println("--- vertex end ---")
+    vertex.persist(StorageLevel.MEMORY_AND_DISK_SER)
 
-    val edge = todayDF.rdd.map(row => {
-      processEdge(schedule_date, row, idSet, idMainSet)
+    println("--- vertex.start ---")
+    //  vertex.take(20).foreach(println)
+    println("--- vertex.end ---")
+    /*
+    vertex.map(r => {
+      OneIDVertex(r._1, r._2._1, r._2._2, r._2._3, r._2._4, r._2._5, r._2._6)
+    })
+    */
+
+    val oldEdge = spark.emptyDataFrame
+      .rdd.map(row => {
+      val srcID = row.getAs[Long]("src_id")
+      val dstID = row.getAs[Long]("dst_id")
+      val attr = row.getAs[String]("attr")
+      OneIDEdge(srcID, dstID, attr)
+    })
+
+    val todayEdge = todayDF.rdd.map(row => {
+      processTodayEdge(schedule_date, row, idSet, idMainSet, bTypeIDMap)
     }).flatMap(l => l)
+      .distinct(coalesce * 4)
 
-    println("--- edge start ---")
-    edge.foreach(println)
-    println("--- edge end ---")
+    todayDF.unpersist()
 
-    //  vertex.persist(StorageLevel.MEMORY_AND_DISK_SER)
-    val graph = Graph(vertex, edge)
+    //  新旧 edge 合并
+    val edge = oldEdge.union(todayEdge)
 
-    val maxGraph = graph.connectedComponents(10)
+    edge.persist(StorageLevel.MEMORY_AND_DISK_SER)
+
+    println("--- edge.start ---")
+    //  edge.take(20).foreach(println)
+    println("--- edge.end ---")
+
+    val graph = Graph(vertex,
+      edge.map(r => {
+        Edge(r.src_id, r.dst_id, r.attr)
+      }))
+
+    val maxGraph = graph.connectedComponents()
 
     val result: VertexRDD[VertexId] = maxGraph.vertices
 
-    println("--- result start ---")
-    result.foreach(println)
-    println("--- result end ---")
+    println("--- result.start ---")
+    //  result.take(20).foreach(println)
+    println("--- result.end ---")
 
     val resultVertex = result.map(rs => (rs._2, rs._1)).groupByKey()
       .map(rs => {
@@ -173,29 +241,54 @@ object IDMappingGraphV2 {
         array
       }).flatMap(l => l)
 
-    val oneIDResult = resultVertex.join(vertex).mapPartitions(rs => {
+    val oneIDVertexDF = resultVertex.join(vertex).mapPartitions(rs => {
       rs.map(r => {
         (r._2._1, r._2._2)
       })
-    }).groupByKey().mapPartitions(rs => {
-      val array = new ArrayBuffer[Result]()
-      rs.foreach(r => {
-        val json = new JSONObject()
-        val sortedList = r._2.toList.sortBy(t => (idSet.indexOf(t._2), t._3))(Ordering.Tuple2(Ordering.Int, Ordering.Long))
-        sortedList.foreach(one => {
-          if (json.isEmpty) {
-            json.put("one_id", one._1)
-            json.put("type", one._2)
-            json.put("version", "")
-          }
-          array += Result(one._1, one._2, json.toJSONString, "")
+    }).groupByKey()
+      .mapPartitions(rs => {
+        val array = new ArrayBuffer[OneIDVertex]()
+        rs.foreach(r => {
+          var json = new JSONObject()
+          val sortedList = r._2.toList.sortBy(t => (t._5, idSet.indexOf(t._2), t._4))(Ordering.Tuple3(Ordering.String, Ordering.Int, Ordering.Long))
+          sortedList.foreach(one => {
+            if (json.isEmpty) {
+              if (one._5.nonEmpty) {
+                json = JSON.parseObject(one._5)
+              } else {
+                json.put("one_id", hashMD5(one._1))
+                json.put("type", one._2)
+                json.put("version", "")
+              }
+            }
+            array += OneIDVertex(getMD5Long(one._1), one._1, one._2, one._3, one._4, json.toJSONString, "")
+            //  array += OneIDVertex(one._1, one._2, json.toJSONString, one._3, "")
+          })
         })
+        array.iterator
       })
-      array.iterator
-    })
 
-    oneIDResult.take(100).foreach(println)
+    vertex.unpersist()
+
+    oneIDVertexDF.persist(StorageLevel.MEMORY_AND_DISK_SER)
+
+    import spark.implicits._
+    //  结果集保存
+    oneIDVertexDF.mapPartitions(rs => {
+      rs.map(r => {
+        Result(r.device_id, r.device_type, r.one_id, r.region, r.update_date)
+      })
+    }).toDF.take(20).foreach(println)
+
+    oneIDVertexDF
+      .toDF.take(20).foreach(println)
+
+    edge
+      .toDF.take(20).foreach(println)
   }
+
+  val typeIDMap: Map[String, String] = Map("idfa" -> "10", "idfv" -> "11", "gaid" -> "20", "imei" -> "21", "oaid" -> "22",
+    "andorid_id" -> "23", "sysid" -> "00")
 
   //  IDFA/GAID
   val didPtn = "^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"
@@ -353,17 +446,21 @@ object IDMappingGraphV2 {
     }
   }
 
-  def processVertex(date: String, row: Row, ids: Array[String], mainIDSet: Set[String]): ArrayBuffer[(Long, (String, String, Long))] = {
-    val array = new ArrayBuffer[(Long, (String, String, Long))]()
+  def processTodayVertex(scheduleDate: String, row: Row, ids: Array[String], mainIDSet: Set[String],
+                         bTypeIDMap: Broadcast[Map[String, String]]): ArrayBuffer[(Long, (String, String, String, Long, String, String))] = {
+    val array = new ArrayBuffer[(Long, (String, String, String, Long, String, String))]()
     //  事件频次
     val cnt = row.getAs[Long]("cnt")
+    //  val region = row.getAs[String]("region")
+    val region = ""
     //  date 活跃日期，用于计算权重
     var mainVertexID = 0L
     for (keyType <- ids if StringUtils.isNotBlank(row.getAs[String](keyType))) {
+      val typeID = bTypeIDMap.value(keyType)
       val deviceID = if (row.getAs[String](keyType).matches(md5Ptn)) {
-        row.getAs[String](keyType)
+        row.getAs[String](keyType) + typeID
       } else {
-        hashMD5(row.getAs[String](keyType))
+        hashMD5(row.getAs[String](keyType)) + typeID
       }
       if (mainVertexID == 0) {
         mainVertexID = getMD5Long(deviceID)
@@ -372,21 +469,23 @@ object IDMappingGraphV2 {
       if (!mainIDSet.contains(keyType)) {
         keyVertexID = keyVertexID + mainVertexID
       }
-      array += ((keyVertexID, (deviceID, keyType, cnt)))
+      array += ((keyVertexID, (deviceID, typeID, region, cnt, new JSONObject().toJSONString, scheduleDate)))
     }
     array
   }
 
-  def processEdge(date: String, row: Row, ids: Array[String], mainIDSet: Set[String]): ArrayBuffer[Edge[String]] = {
-    val array = new ArrayBuffer[Edge[String]]()
+  def processTodayEdge(date: String, row: Row, ids: Array[String], mainIDSet: Set[String],
+                       bTypeIDMap: Broadcast[Map[String, String]]): ArrayBuffer[OneIDEdge] = {
+    val array = new ArrayBuffer[OneIDEdge]()
     var flag = true
     for (i <- ids.indices) {
       var keyType = ids(i)
       if (StringUtils.isNotBlank(row.getAs[String](keyType)) && flag) {
+        var typeID = bTypeIDMap.value(keyType)
         val mainVertexID = if (row.getAs[String](keyType).matches(md5Ptn)) {
-          getMD5Long(row.getAs[String](String.valueOf(keyType)))
+          getMD5Long(row.getAs[String](String.valueOf(keyType)) + typeID)
         } else {
-          getMD5Long(hashMD5(row.getAs[String](keyType)))
+          getMD5Long(hashMD5(row.getAs[String](keyType)) + typeID)
         }
 
         /**
@@ -402,15 +501,16 @@ object IDMappingGraphV2 {
         for (j <- i + 1 until ids.length) {
           keyType = ids(j)
           if (StringUtils.isNotBlank(row.getAs[String](keyType))) {
+            typeID = bTypeIDMap.value(keyType)
             val keyVertexID = if (row.getAs[String](keyType).matches(md5Ptn)) {
-              getMD5Long(row.getAs[String](keyType))
+              getMD5Long(row.getAs[String](keyType) + typeID)
             } else {
-              getMD5Long(hashMD5(row.getAs[String](keyType)))
+              getMD5Long(hashMD5(row.getAs[String](keyType)) + typeID)
             }
             if (!mainIDSet.contains(keyType)) {
-              array += Edge(mainKeyVertexID, keyVertexID + mainVertexID, "")
+              array += OneIDEdge(mainKeyVertexID, keyVertexID + mainVertexID, "")
             } else {
-              array += Edge(mainKeyVertexID, keyVertexID, "")
+              array += OneIDEdge(mainKeyVertexID, keyVertexID, "")
             }
           }
         }
@@ -435,4 +535,9 @@ object IDMappingGraphV2 {
     }
     strm.toLong
   }
+
+  case class OneIDVertex(vertex_id: Long, device_id: String, device_type: String, region: String, cnt: Long,
+                         one_id: String, update_date: String) extends Serializable
+
+  case class OneIDEdge(src_id: Long, dst_id: Long, attr: String) extends Serializable
 }
